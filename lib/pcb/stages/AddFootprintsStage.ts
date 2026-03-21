@@ -1,6 +1,7 @@
 import type {
   CircuitJson,
   CadComponent,
+  PcbHole,
   SourceComponentBase,
 } from "circuit-json"
 import { getKicadCompatibleComponentName } from "../../utils/getKicadCompatibleComponentName"
@@ -31,6 +32,7 @@ import { create3DModelsFromCadComponent } from "./footprints-stage-converters/cr
 import { convertSmdPads } from "./footprints-stage-converters/convertSmdPads"
 import { convertPlatedHoles } from "./footprints-stage-converters/convertPlatedHoles"
 import { convertNpthHoles } from "./footprints-stage-converters/convertNpthHoles"
+import { createNpthPadFromCircuitJson } from "./utils/CreateNpthPadFromCircuitJson"
 
 /**
  * Adds footprints to the PCB from circuit JSON components
@@ -38,6 +40,8 @@ import { convertNpthHoles } from "./footprints-stage-converters/convertNpthHoles
 export class AddFootprintsStage extends ConverterStage<CircuitJson, KicadPcb> {
   private componentsProcessed = 0
   private pcbComponents: any[] = []
+  private boardLevelHoles: PcbHole[] = []
+  private boardLevelHolesProcessed = 0
   private includeBuiltin3dModels: boolean
 
   private getNetInfoForPcbPort(pcbPortId?: string): PcbNetInfo | undefined {
@@ -73,6 +77,13 @@ export class AddFootprintsStage extends ConverterStage<CircuitJson, KicadPcb> {
   ) {
     super(input, ctx)
     this.pcbComponents = this.ctx.db.pcb_component.list()
+    this.boardLevelHoles =
+      this.ctx.db.pcb_hole
+        ?.list()
+        .filter(
+          (hole: PcbHole) =>
+            !("pcb_component_id" in hole) || hole.pcb_component_id == null,
+        ) || []
     this.includeBuiltin3dModels = options?.includeBuiltin3dModels ?? false
   }
 
@@ -87,8 +98,47 @@ export class AddFootprintsStage extends ConverterStage<CircuitJson, KicadPcb> {
       throw new Error("PCB transformation matrix not initialized in context")
     }
 
-    if (this.componentsProcessed >= this.pcbComponents.length) {
+    if (
+      this.componentsProcessed >= this.pcbComponents.length &&
+      this.boardLevelHolesProcessed >= this.boardLevelHoles.length
+    ) {
       this.finished = true
+      return
+    }
+
+    if (this.componentsProcessed >= this.pcbComponents.length) {
+      const pcbHole = this.boardLevelHoles[this.boardLevelHolesProcessed]
+      this.boardLevelHolesProcessed++
+
+      if (!pcbHole || !("x" in pcbHole && "y" in pcbHole)) {
+        return
+      }
+
+      const transformedPos = applyToPoint(c2kMatPcb, {
+        x: pcbHole.x,
+        y: pcbHole.y,
+      })
+
+      const footprintData = `board-hole:${pcbHole.pcb_hole_id}:${transformedPos.x},${transformedPos.y}`
+      const footprint = new Footprint({
+        libraryLink: "tscircuit:board_hole",
+        layer: "F.Cu",
+        at: [transformedPos.x, transformedPos.y, 0],
+        uuid: generateDeterministicUuid(footprintData),
+      })
+
+      const pad = createNpthPadFromCircuitJson({
+        pcbHole,
+        componentCenter: { x: pcbHole.x, y: pcbHole.y },
+        componentRotation: 0,
+      })
+
+      if (pad) {
+        footprint.fpPads = [...footprint.fpPads, pad]
+        const footprints = kicadPcb.footprints
+        footprints.push(footprint)
+        kicadPcb.footprints = footprints
+      }
       return
     }
 
@@ -201,7 +251,9 @@ export class AddFootprintsStage extends ConverterStage<CircuitJson, KicadPcb> {
       this.ctx.db.pcb_hole
         ?.list()
         .filter(
-          (hole: any) => hole.subcircuit_id === component.subcircuit_id,
+          (hole: PcbHole) =>
+            "pcb_component_id" in hole &&
+            hole.pcb_component_id === component.pcb_component_id,
         ) || []
 
     const npthPads = convertNpthHoles(
